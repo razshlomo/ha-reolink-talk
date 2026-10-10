@@ -52,6 +52,16 @@ TOKEN_TTL_SECONDS = 30
 
 TOKEN_STORE_KEY = "live_talk_tokens"
 
+# Ping the browser this often. A client that vanishes without a close frame
+# (phone loses network, app killed) is detected within about this long, so the
+# camera is not left in talk mode until TCP gives up.
+LIVE_TALK_HEARTBEAT_SECONDS = 10
+
+# Hard cap on one live-talk session. Battery cameras behind a hub drop the
+# live session after about 5 minutes anyway; ending it ourselves first means
+# the camera always gets the stop command.
+LIVE_TALK_MAX_SECONDS = 180
+
 
 def _token_store(hass: HomeAssistant) -> dict[str, tuple[str, float]]:
     """Return the {token: (camera_slug, expires_at)} store, creating it if needed."""
@@ -184,7 +194,7 @@ class ReolinkTalkLiveWebSocketView(HomeAssistantView):
             )
             return web.Response(status=401, text="invalid or expired talk token")
 
-        ws = web.WebSocketResponse(max_msg_size=0)
+        ws = web.WebSocketResponse(max_msg_size=0, heartbeat=LIVE_TALK_HEARTBEAT_SECONDS)
         await ws.prepare(request)
 
         resolved = _resolve_camera(hass, camera)
@@ -277,7 +287,25 @@ class ReolinkTalkLiveWebSocketView(HomeAssistantView):
             t0 = time.monotonic()
             pcm_bytes_in = 0
             next_report = t0 + 5.0
-            async for msg in ws:
+            # Not asyncio.timeout() around the loop: cancelling mid-send could
+            # cut a frame on the Baichuan connection we share with the core
+            # integration. Only the wait for the next browser message is bounded.
+            deadline = t0 + LIVE_TALK_MAX_SECONDS
+            while True:
+                remaining = deadline - time.monotonic()
+                try:
+                    if remaining <= 0:
+                        raise TimeoutError
+                    msg = await ws.receive(timeout=remaining)
+                except TimeoutError:
+                    _LOGGER.info(
+                        "Live talk: max duration %ss reached, ending session (camera=%s)",
+                        LIVE_TALK_MAX_SECONDS, camera,
+                    )
+                    await ws.close(code=4004, message=b"max talk duration reached")
+                    break
+                if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
+                    break
                 if msg.type == WSMsgType.BINARY:
                     pcm_bytes_in += len(msg.data)
                     now = time.monotonic()
